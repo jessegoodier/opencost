@@ -2,11 +2,13 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/opencost/opencost/core/pkg/log"
 	"github.com/opencost/opencost/pkg/clustercache"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 
@@ -33,6 +35,22 @@ func NewConfigMapWatchers(kubeClientset kubernetes.Interface, namespace string, 
 	var watchController clustercache.WatchController
 
 	if kubeClientset != nil {
+		// Validate RBAC permissions before starting the watcher
+		// This prevents silent failures and provides clear error messages
+		_, err := kubeClientset.CoreV1().ConfigMaps(namespace).List(context.Background(), metav1.ListOptions{Limit: 1})
+		if err != nil {
+			if apierrors.IsForbidden(err) {
+				panic(fmt.Sprintf(
+					"FATAL: Missing RBAC permissions to list ConfigMaps in namespace '%s'.\n"+
+						"The service account does not have the required permissions.\n"+
+						"Please ensure the service account has a Role/ClusterRole with 'get', 'list', and 'watch' permissions for ConfigMaps.\n"+
+						"Error: %v",
+					namespace, err))
+			}
+			// For other errors (e.g., API server unreachable), log but don't panic
+			log.Warnf("Unable to verify ConfigMap access in namespace '%s': %v", namespace, err)
+		}
+
 		coreRestClient := kubeClientset.CoreV1().RESTClient()
 		watchController = clustercache.NewCachingWatcher(coreRestClient, "configmaps", &v1.ConfigMap{}, namespace, fields.Everything())
 		stopCh = make(chan struct{})
@@ -95,7 +113,19 @@ func (cmw *ConfigMapWatchers) Watch() {
 	for cw := range cmw.watchers {
 		configs, err := cmw.kubeClientset.CoreV1().ConfigMaps(cmw.namespace).Get(context.Background(), cw, metav1.GetOptions{})
 		if err != nil {
-			log.Infof("No %s configmap found at install time, using existing configs: %s", cw, err.Error())
+			if apierrors.IsForbidden(err) {
+				panic(fmt.Sprintf(
+					"FATAL: Missing RBAC permissions to access ConfigMap '%s' in namespace '%s'.\n"+
+						"The service account does not have the required permissions.\n"+
+						"Please ensure the service account has a Role/ClusterRole with 'get', 'list', and 'watch' permissions for ConfigMaps.\n"+
+						"Error: %v",
+					cw, cmw.namespace, err))
+			}
+			if apierrors.IsNotFound(err) {
+				log.Infof("ConfigMap %s not found in namespace %s at install time, using existing configs", cw, cmw.namespace)
+			} else {
+				log.Warnf("Error accessing ConfigMap %s in namespace %s: %v", cw, cmw.namespace, err)
+			}
 		} else {
 			log.Infof("Found configmap %s, watching...", configs.Name)
 			watchConfigFunc(configs)
